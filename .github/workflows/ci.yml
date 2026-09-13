@@ -651,8 +651,8 @@ jobs:
           echo "OK: crate contents ($(wc -l < "$files") files)"
 
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw> --model
-  # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
+  # E2E: `llmman launch <claude|opencode|codex|qwen|hermes|openclaw|vibe>
+  # --model qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
   # real pulled model, a real llama-server, and the real third-party CLIs
   # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
   # (same runners, same msvc-arch/rustflags choices), so the launch/env/
@@ -679,7 +679,7 @@ jobs:
   # non-Apple-Silicon build to test against).
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/opencode/codex/qwen/hermes/openclaw/vibe, vllm-plugin, mlx) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # These take a long time (see the timeout-minutes comment below), so
     # they're skipped on pull_request entirely and only run on the one
@@ -687,30 +687,30 @@ jobs:
     # `release` job's own `needs`, which includes this job for exactly
     # that reason, and its own identical `if:` condition below.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # 6 tests run serialized (--test-threads=1 + lock_serial()), so the
-    # worst case sums all 6's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # 7 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 7's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
     # launch_and_assert's own doc comment), so 30 min/test is only hit if
     # every attempt fails via a missing "pong" instead. Plus warm_model()'s
     # own separate TIMEOUT budget (10 min), paid at most once across all
-    # tests (guarded by WARM's own Once). 6*30 + 10 = 190 min; 210 leaves
+    # tests (guarded by WARM's own Once). 7*30 + 10 = 220 min; 240 leaves
     # headroom on top of that for setup/build overhead (5-8 min on
     # Windows). Exhausting every attempt doesn't fail this job either way
     # (see launch_and_assert's own doc comment) — a run can still
     # legitimately take this long in wall-clock time before giving up.
     #
-    # +90 on top of that 210 (300 total) for the vllm-plugin steps'
+    # +90 on top of that 240 (330 total) for the vllm-plugin steps'
     # own per-step budgets below: up to 60 min for "Install vLLM (e2e)"
     # (wheel downloads, but a slow/retried one on a bad connection) plus
     # up to 30 min for "pytest -m e2e (vllm-plugin)".
     #
-    # +10 more (310 total) for `serve_mlx_safetensors_model`'s own single
+    # +10 more (340 total) for `serve_mlx_safetensors_model`'s own single
     # TIMEOUT budget (10 min, same 600s as warm_model's) — it doesn't go
     # through launch_and_assert's retry loop at all (a real failure there
     # is always a deterministic llmman bug worth failing loudly on, not
-    # small-model sampling variance), so unlike the 6 launch tests above
+    # small-model sampling variance), so unlike the 7 launch tests above
     # it never multiplies by MAX_ATTEMPTS.
-    timeout-minutes: 310
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
@@ -978,6 +978,48 @@ jobs:
           export OPENCODE_CONFIG_CONTENT='{"$schema":"https://opencode.ai/config.json","provider":{"ollama":{"npm":"@ai-sdk/openai-compatible","name":"Ollama","options":{"baseURL":"http://127.0.0.1:1/v1"},"models":{"warmup":{"name":"warmup"}}}},"model":"ollama/warmup"}'
           command -v opencode >/dev/null && timeout --kill-after=10 45 opencode run "hi" --print-logs --log-level DEBUG || true
           [ "$RUNNER_OS" = Windows ] && taskkill //F //T //IM opencode.exe || true
+
+      # ── vibe (Mistral Vibe CLI) ──────────────────────────────────────────
+      # Installed via uv, not npm: vibe is a Python package (`mistral-vibe`
+      # on PyPI), unlike the five Node-based CLIs above. Pinned to 2.25.0,
+      # not the latest release — tests/launch_e2e.rs's own
+      # `launch_vibe_with_model` test was verified against exactly this
+      # version, so an unpinned upgrade could silently change Vibe's own
+      # CLI flags or config format under it with no warning here (the same
+      # reasoning as the qwen/openclaw pins above).
+      #
+      # Installed, and put on PATH, before "Install llama-server"/this
+      # job's "cargo test --test launch_e2e" below spawns the one shared
+      # `llmman serve` daemon every test in that file reuses — same
+      # ordering constraint as "Install mlx-lm" further down (see that
+      # step's own comment): PATH is fixed at that daemon's own spawn
+      # time, so installing vibe any later would leave it unable to find
+      # `vibe` for the rest of this job.
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      # UV_TOOL_BIN_DIR is set explicitly rather than relying on uv's own
+      # per-platform default (`~/.local/bin` on Unix; a location that,
+      # unlike that default, needs no separate PATH registration on
+      # Windows — see astral-sh/setup-uv#83): one fixed location under
+      # `runner.temp` resolves the same way on every OS this job runs on,
+      # so only the "add it to PATH" step below has to differ by platform,
+      # not this one.
+      - name: Install Mistral Vibe CLI
+        shell: bash
+        env:
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/uv-tool-bin
+        run: uv tool install mistral-vibe==2.25.0
+
+      - name: Add vibe to PATH (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "${{ runner.temp }}/uv-tool-bin" >> "$GITHUB_PATH"
+
+      - name: Add vibe to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "${{ runner.temp }}\uv-tool-bin" >> $env:GITHUB_PATH
 
       # ── llama-server (the inference backend `llmman serve` shells out to) ──
       # A prebuilt release straight from upstream llama.cpp, pinned so CI

@@ -1307,14 +1307,13 @@ fn qwen_entry_is_ours(entry: &serde_json::Value, base_url: &str) -> bool {
 const VIBE_ENV_KEY: &str = "LLMMAN_API_KEY";
 
 /// vibe: Mistral Vibe CLI's `config.toml` custom-provider form, pointed at our
-/// `/v1` endpoint. The provider and model use reserved llmman names so a
-/// project-local config cannot shadow the user-level entries this launcher owns.
-/// The active model is selected through Vibe's environment override rather than
-/// inheriting `active_model` from either config file.
+/// `/v1` endpoint. The active model is selected through Vibe's
+/// `VIBE_ACTIVE_MODEL` environment override, the same real model name
+/// `write_vibe_config` just wrote into `config.toml` — matching how
+/// `write_hermes_config` records `default: {model}` directly rather than
+/// through a synthetic alias.
 fn launch_vibe(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Result<()> {
     let bin = find_on_path("vibe").ok_or_else(|| anyhow::anyhow!("vibe is not installed"))?;
-    let workdir = vibe_workdir(extra_args)?;
-    reject_vibe_project_collisions(&workdir)?;
     let effective_model = if model.trim().is_empty() {
         "default"
     } else {
@@ -1327,110 +1326,147 @@ fn launch_vibe(model: &str, api_key: &str, extra_args: &[String]) -> anyhow::Res
         extra_args,
         &[
             (VIBE_ENV_KEY, api_key),
-            ("VIBE_ACTIVE_MODEL", VIBE_MODEL_ALIAS),
+            ("VIBE_ACTIVE_MODEL", effective_model),
         ],
     )
 }
 
-const VIBE_MODEL_ALIAS: &str = "__llmman";
-
-/// Project configuration outranks the user config in Vibe, so either collision
-/// would let a project silently redirect the reserved llmman entry. Refuse the
-/// launch before writing anything when that happens.
-fn reject_vibe_project_collisions(workdir: &Path) -> anyhow::Result<()> {
-    let path = workdir.join(".vibe").join("config.toml");
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    let doc: DocumentMut = contents
-        .parse()
-        .with_context(|| format!("{} does not parse as TOML", path.display()))?;
-
-    if vibe_item_has_inline_table(doc.get("providers"), |table| {
-        table.get("name").and_then(|value| value.as_str()) == Some("llmman")
-    }) || doc
-        .get("providers")
-        .and_then(Item::as_array_of_tables)
-        .is_some_and(|providers| {
-            providers
-                .iter()
-                .any(|provider| provider.get("name").and_then(Item::as_str) == Some("llmman"))
-        })
-    {
-        anyhow::bail!(
-            "Vibe project config {} defines reserved provider `llmman`, which would shadow llmman's provider",
-            path.display()
-        );
-    }
-
-    if vibe_item_has_inline_table(doc.get("models"), |table| {
-        table.get("alias").and_then(|value| value.as_str()) == Some(VIBE_MODEL_ALIAS)
-    }) || doc
-        .get("models")
-        .and_then(Item::as_array_of_tables)
-        .is_some_and(|models| {
-            models
-                .iter()
-                .any(|model| model.get("alias").and_then(Item::as_str) == Some(VIBE_MODEL_ALIAS))
-        })
-    {
-        anyhow::bail!(
-            "Vibe project config {} defines reserved model alias `{VIBE_MODEL_ALIAS}`, which would shadow llmman's model",
-            path.display()
-        );
-    }
-
-    Ok(())
-}
-
-/// Checks inline TOML arrays such as `providers = [{ name = "llmman" }]`.
-/// `toml_edit` exposes those as `Item::Array`, not `ArrayOfTables`, so the
-/// collision check has to cover both representations.
-fn vibe_item_has_inline_table(
-    item: Option<&Item>,
-    matches: impl Fn(&toml_edit::InlineTable) -> bool,
-) -> bool {
-    item.and_then(Item::as_array).is_some_and(|array| {
-        array
-            .iter()
-            .any(|value| value.as_inline_table().is_some_and(&matches))
-    })
-}
-
-/// Resolves the project directory from Vibe's `--workdir`, or the current
-/// directory when Vibe was not given one. Only CLI options before `--` count.
-fn vibe_workdir(extra_args: &[String]) -> anyhow::Result<PathBuf> {
-    let mut args = extra_args.iter().map(String::as_str);
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            break;
-        }
-        let workdir = if arg == "--workdir" {
-            args.next()
-        } else {
-            arg.strip_prefix("--workdir=")
-        };
-        if let Some(workdir) = workdir.filter(|dir| !dir.is_empty()) {
-            let path = PathBuf::from(workdir);
-            return if path.is_absolute() {
-                Ok(path)
-            } else {
-                Ok(std::env::current_dir()?.join(path))
-            };
-        }
-    }
-    std::env::current_dir().context("no current directory")
-}
-
 /// `$VIBE_HOME` if set, else `~/.vibe` — matches vibe's own resolution
-/// (see the "Vibe home directory" section of its configuration docs).
+/// (see the "Vibe home directory" section of its configuration docs). A
+/// set `$VIBE_HOME` goes through the same `expanduser().resolve()` Vibe
+/// applies to it (see `vibe_resolve_path`), so a quoted
+/// `VIBE_HOME="~/.vibe-alt"` — an unexpanded literal `~`, since the quotes
+/// stop the shell from expanding it — lands in the same directory for
+/// both llmman and Vibe, rather than under llmman's current directory.
 fn vibe_home() -> anyhow::Result<PathBuf> {
     match std::env::var("VIBE_HOME").ok().filter(|d| !d.is_empty()) {
-        Some(dir) => Ok(PathBuf::from(dir)),
+        Some(dir) => vibe_resolve_path(&dir),
         None => Ok(dirs::home_dir().context("no home directory")?.join(".vibe")),
     }
+}
+
+/// Python's `Path(raw).expanduser().resolve()`, the way Vibe itself
+/// resolves both `--workdir` and `$VIBE_HOME`: `expand_user` first, then
+/// the result is made absolute against the current directory and its
+/// symlinks are followed component by component (`resolve_symlinks`),
+/// exactly the on-disk directory Vibe itself would end up reading from —
+/// a purely lexical `.`/`..` collapse is not enough when `--workdir`
+/// passes through a symlink, since that would check one directory while
+/// Vibe, following the same symlink, reads its target.
+fn vibe_resolve_path(raw: &str) -> anyhow::Result<PathBuf> {
+    let expanded = expand_user(raw)?;
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()?.join(expanded)
+    };
+    resolve_symlinks(&absolute)
+}
+
+/// `~`, `~/rest`, and `~name`/`~name/rest`, the three forms Python's
+/// `os.path.expanduser()` handles (which is what Vibe's own
+/// `Path.expanduser()` calls under the hood). `~name` is looked up
+/// through the system user database via `getpwnam(3)` (see
+/// `home_dir_of`), the same source `expanduser()` uses, rather than
+/// guessing a sibling of the current user's home directory. An unknown
+/// `~name` is left untouched, matching Python: `expanduser()` catches the
+/// lookup failure and returns the original string rather than erroring.
+fn expand_user(raw: &str) -> anyhow::Result<PathBuf> {
+    if raw == "~" {
+        return dirs::home_dir().context("no home directory");
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return Ok(dirs::home_dir().context("no home directory")?.join(rest));
+    }
+    if let Some(rest) = raw.strip_prefix('~') {
+        let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if !name.is_empty() {
+            if let Some(home) = home_dir_of(name) {
+                return Ok(if tail.is_empty() { home } else { home.join(tail) });
+            }
+        }
+    }
+    Ok(PathBuf::from(raw))
+}
+
+/// The named user's home directory, via `getpwnam(3)` — the same system
+/// user database Python's `expanduser()` consults, so a `~name` here
+/// lands wherever the OS itself says that user's home directory is
+/// (including directory-service-backed accounts, not just local
+/// `/etc/passwd` entries). `None` for an unknown user or on a platform
+/// without one (`~name` is POSIX-specific; Python's own `expanduser()`
+/// does not expand it on Windows either).
+#[cfg(unix)]
+fn home_dir_of(name: &str) -> Option<PathBuf> {
+    nix::unistd::User::from_name(name).ok().flatten().map(|user| user.dir)
+}
+
+#[cfg(not(unix))]
+fn home_dir_of(_name: &str) -> Option<PathBuf> {
+    None
+}
+
+/// Follows symlinks component by component, the way Python's
+/// `os.path.realpath(path, strict=False)` does (what `Path.resolve()`
+/// calls internally, and so what Vibe itself sees `--workdir`/`$VIBE_HOME`
+/// as). Every component that exists on disk has its symlinks resolved;
+/// the first component that does not exist — and everything after it —
+/// is kept literally, since Vibe may be about to create it and there is
+/// nothing on disk yet to resolve. `..` always pops the path already
+/// resolved so far rather than asking the filesystem, which is exactly
+/// right here: by the time `..` is processed, every earlier component
+/// has already been resolved, so popping it back off undoes exactly the
+/// directory that would be popped on a real filesystem, including
+/// through a symlink. `path` must already be absolute.
+fn resolve_symlinks(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    resolve_symlinks_into(PathBuf::new(), path, &mut seen)
+}
+
+fn resolve_symlinks_into(
+    mut resolved: PathBuf,
+    rest: &Path,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    use std::path::Component;
+    for component in rest.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                resolved = PathBuf::from(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if resolved.components().next_back() != Some(Component::RootDir) {
+                    resolved.pop();
+                }
+            }
+            Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                let is_symlink = std::fs::symlink_metadata(&candidate)
+                    .is_ok_and(|meta| meta.file_type().is_symlink());
+                if !is_symlink {
+                    // Does not exist, is not a symlink, or is
+                    // unreadable: kept literally, same as
+                    // `os.path.realpath(..., strict=False)`.
+                    resolved = candidate;
+                    continue;
+                }
+                anyhow::ensure!(
+                    seen.insert(candidate.clone()),
+                    "symlink loop resolving {}",
+                    candidate.display()
+                );
+                let target = std::fs::read_link(&candidate)
+                    .with_context(|| format!("read symlink {}", candidate.display()))?;
+                resolved = if target.is_absolute() {
+                    resolve_symlinks_into(PathBuf::new(), &target, seen)?
+                } else {
+                    resolve_symlinks_into(resolved, &target, seen)?
+                };
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// Records llmman as a provider in vibe's `config.toml`, as
@@ -1456,11 +1492,39 @@ fn write_vibe_config(model: &str, base_url: &str) -> anyhow::Result<()> {
         .with_context(|| format!("write {}", config_path.display()))
 }
 
-/// `existing` with llmman's provider and reserved model alias merged in, pure
-/// so a test can hand it a literal. An existing `llmman` provider is replaced
-/// only when its ownership fingerprint matches. Any other provider with that
-/// name, or any other model using the reserved alias, is rejected.
-/// Unrelated providers/models and top-level content are preserved.
+/// Converts an inline `key = [{ ... }, ...]` array in `table` into the
+/// `[[key]]` array-of-tables representation, in place. Left untouched —
+/// and so still surfaced by the later `as_array_of_tables_mut()` calls in
+/// `vibe_config_merged` — when `key` is absent, already an array of
+/// tables, or an array holding something other than inline tables, a
+/// shape Vibe would reject too and this file does not try to interpret
+/// further (see `vibe_config_merged_rejects_what_it_cannot_safely_merge_into`).
+fn normalize_vibe_array_of_tables(table: &mut Table, key: &str) {
+    let Some(array) = table.get(key).and_then(Item::as_array) else {
+        return;
+    };
+    if !array.iter().all(|v| v.is_inline_table()) {
+        return;
+    }
+    let mut converted = ArrayOfTables::new();
+    for value in array.iter() {
+        let inline = value
+            .as_inline_table()
+            .expect("just checked every element is an inline table")
+            .clone();
+        converted.push(inline.into_table());
+    }
+    table.insert(key, Item::ArrayOfTables(converted));
+}
+
+/// `existing` with llmman's provider and model entry merged in, pure so a
+/// test can hand it a literal. Any `[[providers]]` named `llmman`, and any
+/// `[[models]]` with `provider = "llmman"`, is llmman's own and is replaced;
+/// everything else — unrelated providers/models and top-level content — is
+/// left alone. A `[[providers]]`/`[[models]]` entry naming itself `llmman`
+/// is the user's own choice to make (e.g. by hand-editing `config.toml`, or
+/// pointing a project-local `.vibe/config.toml` at it); llmman treats it as
+/// its own rather than second-guessing why it is there.
 fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Result<String> {
     let mut doc: DocumentMut = if existing.trim().is_empty() {
         DocumentMut::new()
@@ -1468,48 +1532,15 @@ fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Re
         existing.parse().context("invalid TOML")?
     };
 
-    let provider_ours = if let Some(providers) = doc
-        .as_table()
-        .get("providers")
-        .and_then(Item::as_array_of_tables)
-    {
-        let mut found = false;
-        for provider in providers
-            .iter()
-            .filter(|t| t.get("name").and_then(Item::as_str) == Some("llmman"))
-        {
-            found = true;
-            anyhow::ensure!(
-                vibe_provider_is_ours(provider),
-                "cannot update Vibe provider `llmman`: an existing provider with that name is not managed by llmman"
-            );
-        }
-        found
-    } else {
-        false
-    };
-
-    let model_alias_conflict = if let Some(models) = doc
-        .as_table()
-        .get("models")
-        .and_then(Item::as_array_of_tables)
-    {
-        let mut conflict = false;
-        for model_table in models
-            .iter()
-            .filter(|t| t.get("alias").and_then(Item::as_str) == Some(VIBE_MODEL_ALIAS))
-        {
-            let ours = model_table.get("provider").and_then(Item::as_str) == Some("llmman");
-            anyhow::ensure!(
-                ours,
-                "cannot update Vibe reserved model alias `{VIBE_MODEL_ALIAS}`: an existing model with that alias is not managed by llmman"
-            );
-            conflict = true;
-        }
-        conflict
-    } else {
-        false
-    };
+    // Valid TOML can spell either key as an inline array of inline tables
+    // (`providers = [{ name = "llmman" }]`) rather than `[[providers]]`
+    // sections; `toml_edit` exposes the two differently (`Item::Array` vs
+    // `Item::ArrayOfTables`). The merge below only ever worked with the
+    // latter, so an inline list made an otherwise valid file unmergeable.
+    // Converting first, in place, means the merge only has to handle one
+    // shape.
+    normalize_vibe_array_of_tables(doc.as_table_mut(), "providers");
+    normalize_vibe_array_of_tables(doc.as_table_mut(), "models");
 
     let providers = doc
         .as_table_mut()
@@ -1517,9 +1548,7 @@ fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Re
         .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .ok_or_else(|| anyhow::anyhow!("`providers` is not an array of tables"))?;
-    if provider_ours {
-        providers.retain(|t| t.get("name").and_then(Item::as_str) != Some("llmman"));
-    }
+    providers.retain(|t| t.get("name").and_then(Item::as_str) != Some("llmman"));
     let mut provider = Table::new();
     provider.insert("name", value("llmman"));
     provider.insert("api_base", value(base_url));
@@ -1534,30 +1563,20 @@ fn vibe_config_merged(existing: &str, model: &str, base_url: &str) -> anyhow::Re
         .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .ok_or_else(|| anyhow::anyhow!("`models` is not an array of tables"))?;
-    if model_alias_conflict {
-        models.retain(|t| t.get("alias").and_then(Item::as_str) != Some(VIBE_MODEL_ALIAS));
-    }
+    models.retain(|t| t.get("provider").and_then(Item::as_str) != Some("llmman"));
     let mut model_table = Table::new();
     model_table.insert("name", value(model));
     model_table.insert("provider", value("llmman"));
-    model_table.insert("alias", value(VIBE_MODEL_ALIAS));
+    // The model name itself, not a synthetic alias — hermes records
+    // `default: {model}` the same way, and this is what `VIBE_ACTIVE_MODEL`
+    // is set to in `launch_vibe`, so Vibe shows the user their actual model
+    // name as the active model rather than an internal placeholder.
+    model_table.insert("alias", value(model));
     models.push(model_table);
 
     Ok(doc.to_string())
 }
 
-/// Matches the stable fields that identify the provider written by llmman.
-/// The API base is intentionally not part of the fingerprint because the
-/// daemon address may change between launches.
-fn vibe_provider_is_ours(provider: &Table) -> bool {
-    let api_key_env_var = provider.get("api_key_env_var").and_then(Item::as_str);
-    let api_style = provider.get("api_style").and_then(Item::as_str);
-    let backend = provider.get("backend").and_then(Item::as_str);
-
-    api_key_env_var == Some(VIBE_ENV_KEY)
-        && api_style == Some("openai")
-        && backend == Some("generic")
-}
 
 // ---------------------------------------------------------------------------
 // Process execution helper
@@ -2071,7 +2090,8 @@ mod tests {
     }
 
     /// A fresh file gets exactly one provider/model pair in the shape
-    /// Mistral's own docs show for a custom provider, using the reserved alias.
+    /// Mistral's own docs show for a custom provider, using the model name
+    /// itself as the alias.
     #[test]
     fn vibe_config_merged_writes_a_fresh_file() {
         let url = "http://127.0.0.1:17434/v1";
@@ -2082,7 +2102,7 @@ mod tests {
         assert!(out.contains(&format!("api_key_env_var = \"{VIBE_ENV_KEY}\"")));
         assert!(out.contains("[[models]]"));
         assert!(out.contains("provider = \"llmman\""));
-        assert!(out.contains(&format!("alias = \"{VIBE_MODEL_ALIAS}\"")));
+        assert!(out.contains("alias = \"gemma4\""));
     }
 
     /// A second launch with the same model must not touch the file — the
@@ -2097,11 +2117,12 @@ mod tests {
         assert_eq!(once, twice);
     }
 
-    /// A user's own providers/models and unrelated top-level keys survive; an
-    /// llmman provider is replaced only by ownership, and only llmman's reserved
-    /// model alias is replaced.
+    /// A user's own providers/models and unrelated top-level keys survive;
+    /// any provider literally named `llmman`, and any model with
+    /// `provider = "llmman"`, is replaced — matched purely by name, no
+    /// ownership fingerprint.
     #[test]
-    fn vibe_config_merged_replaces_only_llmmans_own_entries() {
+    fn vibe_config_merged_replaces_any_entry_named_llmman() {
         let existing = "\
 default_agent = \"plan\"
 
@@ -2134,78 +2155,184 @@ alias = \"old-model\"
         assert!(out.contains("name = \"openrouter\""));
         assert!(out.contains("codestral-openrouter"));
         assert!(out.contains("default_agent = \"plan\""));
-        assert!(out.contains("old-model"));
+        assert!(!out.contains("old-model"));
         assert!(!out.contains("10.0.0.2"));
         assert_eq!(out.matches("name = \"llmman\"").count(), 1);
-        assert_eq!(out.matches("provider = \"llmman\"").count(), 2);
+        assert_eq!(out.matches("provider = \"llmman\"").count(), 1);
         assert!(out.contains(&format!("api_base = \"{url}\"")));
         assert!(!out.contains("active_model ="));
-        assert!(out.contains(&format!("alias = \"{VIBE_MODEL_ALIAS}\"")));
+        assert!(out.contains("alias = \"new-model\""));
     }
 
+    /// A provider already named `llmman` — however it got there, by hand
+    /// or from another tool — is llmman's to take over and rewrite, not a
+    /// conflict to reject: the name itself is the only signal llmman uses.
     #[test]
-    fn vibe_config_merged_rejects_a_foreign_llmman_provider() {
+    fn vibe_config_merged_takes_over_any_provider_named_llmman() {
         let existing = "[[providers]]\nname = \"llmman\"\napi_base = \"https://example.com/v1\"\napi_key_env_var = \"OTHER_API_KEY\"\napi_style = \"openai\"\nbackend = \"generic\"\n";
-        let err =
-            vibe_config_merged(existing, "new-model", "http://127.0.0.1:17434/v1").unwrap_err();
-        assert!(err.to_string().contains("provider `llmman`"));
-        assert!(err.to_string().contains("not managed by llmman"));
+        let url = "http://127.0.0.1:17434/v1";
+        let out = vibe_config_merged(existing, "new-model", url).unwrap();
+        assert_eq!(out.matches("name = \"llmman\"").count(), 1);
+        assert!(out.contains(&format!("api_base = \"{url}\"")));
+        assert!(out.contains(&format!("api_key_env_var = \"{VIBE_ENV_KEY}\"")));
+        assert!(!out.contains("OTHER_API_KEY"));
+        assert!(!out.contains("example.com"));
     }
 
+    /// A model is only ever matched (and replaced) by `provider =
+    /// "llmman"`; an unrelated model that merely happens to use the alias
+    /// llmman would otherwise pick is left untouched — aliases carry no
+    /// special meaning of their own.
     #[test]
-    fn vibe_config_merged_rejects_a_foreign_reserved_model_alias() {
-        let existing = "[[models]]\nname = \"someone-elses-model\"\nprovider = \"openrouter\"\nalias = \"__llmman\"\n";
-        let err =
-            vibe_config_merged(existing, "new-model", "http://127.0.0.1:17434/v1").unwrap_err();
-        assert!(err.to_string().contains("reserved model alias"));
-        assert!(err.to_string().contains("not managed by llmman"));
+    fn vibe_config_merged_leaves_an_unrelated_model_with_a_lookalike_alias_alone() {
+        let existing =
+            "[[models]]\nname = \"someone-elses-model\"\nprovider = \"openrouter\"\nalias = \"new-model\"\n";
+        let out = vibe_config_merged(existing, "new-model", "http://127.0.0.1:17434/v1").unwrap();
+        assert!(out.contains("someone-elses-model"));
+        assert!(out.contains("provider = \"openrouter\""));
+        assert_eq!(out.matches("alias = \"new-model\"").count(), 2);
+        assert_eq!(out.matches("provider = \"llmman\"").count(), 1);
     }
 
+    /// A leading `~` expands against the home directory, matching Vibe's
+    /// own `Path(value).expanduser()` — without this, `--workdir
+    /// ~/project` would have this guard check a literal `./~/project`
+    /// while Vibe launched under the user's actual home directory.
     #[test]
-    fn reject_vibe_project_collisions_rejects_reserved_provider_and_model() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-vibe-project-collision-{}-{}",
+    fn vibe_resolve_path_expands_a_leading_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(vibe_resolve_path("~/project").unwrap(), home.join("project"));
+        assert_eq!(vibe_resolve_path("~").unwrap(), home);
+    }
+
+    /// A relative path is made absolute against the current directory,
+    /// matching `resolve()`.
+    #[test]
+    fn vibe_resolve_path_makes_a_relative_path_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            vibe_resolve_path("some/relative/dir").unwrap(),
+            cwd.join("some/relative/dir")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vibe_resolve_path_leaves_an_absolute_path_alone() {
+        assert_eq!(
+            vibe_resolve_path("/already/absolute").unwrap(),
+            PathBuf::from("/already/absolute")
+        );
+    }
+
+    /// `resolve()` normalizes `.`/`..` lexically and does not require the
+    /// path to exist — Vibe may be about to create it, and so might this
+    /// guard's caller be pointing at a directory nobody has made yet.
+    #[test]
+    fn vibe_resolve_path_normalizes_dot_dot_without_requiring_it_to_exist() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            vibe_resolve_path("almost-certainly-missing/../also-missing").unwrap(),
+            cwd.join("also-missing")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vibe_resolve_path_does_not_escape_the_root_via_dot_dot() {
+        assert_eq!(
+            resolve_symlinks(Path::new("/../../certainly-not-a-real-directory-xyz")).unwrap(),
+            PathBuf::from("/certainly-not-a-real-directory-xyz")
+        );
+    }
+
+    /// `--workdir` (or `$VIBE_HOME`) passed through a symlink must resolve
+    /// to the symlink's real target, the same directory Vibe itself would
+    /// end up reading `config.toml` from — a lexical-only `.`/`..` collapse
+    /// would instead have this guard inspect the symlink's location, an
+    /// entirely different directory that may hold no config at all.
+    #[cfg(unix)]
+    #[test]
+    fn vibe_resolve_path_follows_a_symlink_to_its_real_target() {
+        let base = std::env::temp_dir().join(format!(
+            "llmman-vibe-symlink-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let config_dir = dir.join(".vibe");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let path = config_dir.join("config.toml");
-        std::fs::write(
-            &path,
-            "[[providers]]\nname = \"llmman\"\napi_base = \"https://example.com/v1\"\n",
-        )
-        .unwrap();
-        let err = reject_vibe_project_collisions(&dir).unwrap_err();
-        assert!(err.to_string().contains("reserved provider `llmman`"));
+        let real_dir = base.join("real-project");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link = base.join("link-to-project");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
 
-        std::fs::write(
-            &path,
-            "[[models]]\nname = \"someone-elses-model\"\nprovider = \"openrouter\"\nalias = \"__llmman\"\n",
-        )
-        .unwrap();
-        let err = reject_vibe_project_collisions(&dir).unwrap_err();
-        assert!(err.to_string().contains("reserved model alias `__llmman`"));
+        assert_eq!(
+            vibe_resolve_path(link.to_str().unwrap()).unwrap(),
+            resolve_symlinks(&real_dir).unwrap()
+        );
+        // And a path reached *through* the link keeps resolving on the
+        // other side of it.
+        assert_eq!(
+            vibe_resolve_path(link.join("nested").to_str().unwrap()).unwrap(),
+            resolve_symlinks(&real_dir).unwrap().join("nested")
+        );
 
-        std::fs::write(
-            &path,
-            "providers = [{ name = \"llmman\", api_base = \"https://example.com/v1\" }]\n",
-        )
-        .unwrap();
-        let err = reject_vibe_project_collisions(&dir).unwrap_err();
-        assert!(err.to_string().contains("reserved provider `llmman`"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
-        std::fs::write(
-            &path,
-            "models = [{ name = \"someone-elses-model\", provider = \"openrouter\", alias = \"__llmman\" }]\n",
-        )
-        .unwrap();
-        let err = reject_vibe_project_collisions(&dir).unwrap_err();
-        assert!(err.to_string().contains("reserved model alias `__llmman`"));
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A symlink cycle is a clear error, not an infinite loop or a
+    /// silently wrong answer.
+    #[cfg(unix)]
+    #[test]
+    fn vibe_resolve_path_rejects_a_symlink_loop() {
+        let base = std::env::temp_dir().join(format!(
+            "llmman-vibe-symlink-loop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let a = base.join("a");
+        let b = base.join("b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        assert!(vibe_resolve_path(a.to_str().unwrap()).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `~name` looks the user up through the system user database
+    /// (`getpwnam(3)`), the same source Python's `expanduser()` uses —
+    /// checked here against the current user, whose name and home
+    /// directory this process already knows independently of the
+    /// function under test.
+    #[cfg(unix)]
+    #[test]
+    fn vibe_resolve_path_expands_a_named_user_tilde() {
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .expect("current uid has a passwd entry");
+        assert_eq!(
+            vibe_resolve_path(&format!("~{}/project", me.name)).unwrap(),
+            resolve_symlinks(&me.dir).unwrap().join("project")
+        );
+    }
+
+    /// An unknown `~name` is left as a literal (relative) path rather
+    /// than erroring, matching Python's `expanduser()`, which catches the
+    /// lookup failure and returns the original string unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn vibe_resolve_path_leaves_an_unknown_named_tilde_untouched() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            vibe_resolve_path("~this-user-almost-certainly-does-not-exist-xyz/project").unwrap(),
+            cwd.join("~this-user-almost-certainly-does-not-exist-xyz/project")
+        );
     }
 
     /// A hand-edited `providers`/`models` key that is not an array of
@@ -2216,6 +2343,56 @@ alias = \"old-model\"
         let url = "http://127.0.0.1:17434/v1";
         assert!(vibe_config_merged("providers = \"not a table\"", "m", url).is_err());
         assert!(vibe_config_merged("not [ valid toml", "m", url).is_err());
+    }
+
+    /// `providers`/`models` written as an inline array of inline tables
+    /// must merge instead of erroring out. Before
+    /// `normalize_vibe_array_of_tables` this always failed with "not an
+    /// array of tables", so nobody with a file in this shape could launch
+    /// Vibe at all.
+    #[test]
+    fn vibe_config_merged_accepts_an_inline_providers_and_models_array() {
+        let existing = "\
+providers = [{ name = \"openrouter\", api_base = \"https://openrouter.ai/api/v1\" }]
+models = [{ name = \"mistralai/codestral\", provider = \"openrouter\", alias = \"codestral\" }]
+";
+        let out =
+            vibe_config_merged(existing, "new-model", "http://127.0.0.1:17434/v1").unwrap();
+        assert!(out.contains("[[providers]]"));
+        assert!(out.contains("name = \"openrouter\""));
+        assert!(out.contains("name = \"llmman\""));
+        assert!(out.contains("[[models]]"));
+        assert!(out.contains("codestral"));
+        assert!(out.contains("alias = \"new-model\""));
+    }
+
+    /// A provider/model named/owned by `llmman` is taken over the same way
+    /// whether the file spells `providers`/`models` as an inline array or
+    /// as `[[providers]]`/`[[models]]` sections — the merge only ever
+    /// looked at the array-of-tables shape, so before normalizing first, an
+    /// inline `llmman` entry would have ended up duplicated alongside the
+    /// fresh one instead of replaced.
+    #[test]
+    fn vibe_config_merged_takes_over_an_inline_llmman_entry_too() {
+        let url = "http://127.0.0.1:17434/v1";
+        let out = vibe_config_merged(
+            "providers = [{ name = \"llmman\", api_base = \"https://example.com/v1\" }]",
+            "m",
+            url,
+        )
+        .unwrap();
+        assert_eq!(out.matches("name = \"llmman\"").count(), 1);
+        assert!(out.contains(&format!("api_base = \"{url}\"")));
+
+        let out = vibe_config_merged(
+            "models = [{ name = \"old-model\", provider = \"llmman\", alias = \"old-model\" }]",
+            "m",
+            url,
+        )
+        .unwrap();
+        assert!(!out.contains("old-model"));
+        assert_eq!(out.matches("provider = \"llmman\"").count(), 1);
+        assert!(out.contains("alias = \"m\""));
     }
 
     /// Regression test for the codex config bug described on
