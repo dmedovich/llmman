@@ -8,17 +8,15 @@
 //! `scripts/install.sh`'s `check_gpu`), applied here to llmman's
 //! PATH-optional `llama-server` dependency instead.
 //!
-//! `cmd::serve`'s local (non-`--ociman`) path still prefers whatever
-//! `llama-server` is already on `PATH` (see `resolve_llama_server`
-//! there) — this module is only reached as a fallback, or when
-//! `--llama-cpp-version` pins an explicit release. Once downloaded, a
-//! given release+backend combination is cached under
-//! [`install_root`]`/<tag>/<backend>/` and never re-fetched.
+//! This is `cmd::serve`'s `--runtime bin` (see `cmd::serve::runtime`).
+//! A given release+backend is cached under
+//! [`install_root`]`/<tag>/<backend>/` and never re-fetched; the release
+//! is [`default_release`] unless `--llama-cpp-version` says otherwise.
 //!
 //! Coverage gap (unavoidable, not an llmman limitation): llama.cpp does
 //! not publish a prebuilt **Linux** CUDA binary at all — only Windows
 //! gets prebuilt CUDA — so an NVIDIA GPU detected on Linux falls back to
-//! the CPU build here, with a message pointing at `llmman serve --ociman
+//! the CPU build here, with a message pointing at `llmman serve --runtime
 //! docker` (see `crate::container`, which *does* have a CUDA path via
 //! `ghcr.io/ggml-org/llama.cpp:server-cuda*`) as the GPU-accelerated
 //! alternative.
@@ -39,6 +37,15 @@ use crate::hostgpu::HostGpu;
 
 const REPO_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp";
 
+/// The default `--llama-cpp-version`: the `b<N>` release
+/// [`ensure_llama_server`] downloads and the image tag suffix
+/// `crate::container` runs. From the repo-root `LLAMA_CPP_RELEASE` file,
+/// which CI also installs and bases the `ai/llmman` images on, so what
+/// ships is what was tested. The single place to bump.
+pub fn default_release() -> &'static str {
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/LLAMA_CPP_RELEASE")).trim()
+}
+
 // ---------------------------------------------------------------------------
 // GitHub Releases API
 // ---------------------------------------------------------------------------
@@ -55,7 +62,7 @@ struct Asset {
     browser_download_url: String,
 }
 
-fn http_client() -> Result<reqwest::blocking::Client> {
+pub(crate) fn http_client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         // Large Windows CUDA packages bundle the CUDA runtime itself
         // (hundreds of MB) — a short fixed timeout would abort a real,
@@ -250,7 +257,7 @@ fn asset_query() -> AssetQuery {
                 eprintln!(
                     "[llmman] NVIDIA GPU detected, but llama.cpp does not publish a \
                      prebuilt Linux CUDA binary — falling back to the CPU build. Use \
-                     `llmman serve --ociman docker` (or `--ociman podman`) for GPU \
+                     `llmman serve --runtime docker` (or `--runtime podman`) for GPU \
                      acceleration on Linux, or build llama.cpp yourself with \
                      GGML_CUDA=ON and put llama-server on PATH."
                 );
@@ -324,17 +331,10 @@ fn asset_query() -> AssetQuery {
 
 /// `~/.local/share/llmman/llama-server` on Linux/macOS,
 /// `%LOCALAPPDATA%\llmman\llama-server` on Windows — sibling of
-/// [`crate::default_store`]'s own store directory.
+/// [`crate::default_store`]'s own store directory, under
+/// [`crate::data_root`].
 fn install_root() -> Result<PathBuf> {
-    #[cfg(not(target_os = "windows"))]
-    let base = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not determine home directory"))?
-        .join(".local")
-        .join("share");
-    #[cfg(target_os = "windows")]
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("could not determine local data directory"))?;
-    Ok(base.join("llmman").join("llama-server"))
+    Ok(crate::data_root()?.join("llama-server"))
 }
 
 fn install_dir(tag: &str, label: &str) -> Result<PathBuf> {
@@ -363,9 +363,9 @@ fn parse_tmp_dir(value: Option<&str>) -> Option<PathBuf> {
 }
 
 /// Includes our own pid in the filename so two `llmman` processes
-/// downloading the same asset at once (e.g. two concurrent `--pull-bin`
+/// downloading the same asset at once (e.g. two concurrent `--pull-only`
 /// runs) never share a staging path.
-fn tmp_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn tmp_path(name: &str) -> Result<PathBuf> {
     let dir = tmp_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir.join(format!("{name}.tmp-{}", std::process::id())))
@@ -373,7 +373,7 @@ fn tmp_path(name: &str) -> Result<PathBuf> {
 
 /// Removes the staging file on drop, so a failed download or extraction
 /// (an early `?` return) doesn't leave the archive behind.
-struct RemoveOnDrop<'a>(&'a Path);
+pub(crate) struct RemoveOnDrop<'a>(pub(crate) &'a Path);
 
 impl Drop for RemoveOnDrop<'_> {
     fn drop(&mut self) {
@@ -386,7 +386,7 @@ impl Drop for RemoveOnDrop<'_> {
 /// to hardcode each archive format's own internal layout (Linux/macOS
 /// tarballs nest everything under one `llama-<tag>/` directory; Windows
 /// zips ship every file flat at the archive root).
-fn find_binary(dir: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn find_binary(dir: &Path, name: &str) -> Option<PathBuf> {
     walkdir::WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -416,9 +416,10 @@ fn download_marker_path() -> Result<PathBuf> {
     Ok(install_root()?.join(".downloading"))
 }
 
-/// Whether some process is currently mid-download of a llama-server
-/// release: the marker exists and was touched recently enough to belong
-/// to a live download rather than a crashed one.
+/// Whether some process is currently mid-download of llama.cpp — a
+/// release build here, or a container image (`cmd::serve::runtime` holds
+/// the same marker around its pulls): the marker exists and was touched
+/// recently enough to belong to a live download rather than a crashed one.
 pub fn download_in_progress() -> bool {
     download_marker_path().is_ok_and(|path| marker_is_fresh(&path, DOWNLOAD_MARKER_STALE_AFTER))
 }
@@ -438,11 +439,15 @@ fn marker_is_fresh(path: &Path, stale_after: Duration) -> bool {
 
 /// Creates the marker on construction and removes it on drop, so success
 /// and every early `?` return both clear it. Best-effort throughout: a
-/// marker failure must never fail the download itself.
-struct DownloadMarker(Option<PathBuf>);
+/// marker failure must never fail the download itself. Also held around
+/// container pulls (`cmd::serve::runtime`), which must [`touch`] it
+/// within [`DOWNLOAD_MARKER_STALE_AFTER`].
+///
+/// [`touch`]: DownloadMarker::touch
+pub(crate) struct DownloadMarker(Option<PathBuf>);
 
 impl DownloadMarker {
-    fn create() -> DownloadMarker {
+    pub(crate) fn create() -> DownloadMarker {
         match download_marker_path() {
             Ok(p) => Self::create_at(p),
             Err(_) => DownloadMarker(None),
@@ -461,7 +466,7 @@ impl DownloadMarker {
 
     /// Refreshes the marker's mtime so a reader can tell this live
     /// download from a crashed one whose Drop never ran.
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         if let Some(path) = &self.0 {
             // Windows keeps the old mtime when a write is zero bytes,
             // so set it explicitly.
@@ -509,12 +514,12 @@ fn create_new_file(dest: &Path) -> Result<std::fs::File> {
     }
 }
 
-fn download_to_file(
+pub(crate) fn download_to_file(
     client: &reqwest::blocking::Client,
     url: &str,
     dest: &Path,
     label: &str,
-    marker: &DownloadMarker,
+    marker: Option<&DownloadMarker>,
 ) -> Result<()> {
     let mut resp = client
         .get(url)
@@ -536,7 +541,9 @@ fn download_to_file(
         file.write_all(&buf[..n]).context("write downloaded data")?;
         downloaded += n as u64;
         if last_logged.elapsed() >= PROGRESS_LOG_INTERVAL {
-            marker.touch();
+            if let Some(marker) = marker {
+                marker.touch();
+            }
             if total > 0 {
                 eprintln!(
                     "[llmman] downloading {label}: {} / {} ({}%)",
@@ -552,7 +559,7 @@ fn download_to_file(
     Ok(())
 }
 
-fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
     let file = std::fs::File::open(archive_path)
         .with_context(|| format!("open {}", archive_path.display()))?;
@@ -606,8 +613,7 @@ pub struct Resolved {
 /// `resolve_release`) and the pointer file is mutable upstream.
 ///
 /// Blocking (network + disk I/O) — callers on an async runtime must run
-/// this via `tokio::task::spawn_blocking` (see `cmd::serve`'s
-/// `resolve_llama_server`).
+/// this via `tokio::task::spawn_blocking` (see `cmd::serve::runtime::resolve`).
 pub fn ensure_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     let query = asset_query();
     let bin_name = if cfg!(target_os = "windows") {
@@ -698,7 +704,7 @@ fn try_ensure_from_network(
         &asset.browser_download_url,
         &tmp,
         &asset.name,
-        &marker,
+        Some(&marker),
     )?;
     marker.touch();
     extract(&tmp, &asset.name, &dest)?;
@@ -715,7 +721,7 @@ fn try_ensure_from_network(
                     &companion.browser_download_url,
                     &tmp2,
                     &companion.name,
-                    &marker,
+                    Some(&marker),
                 )?;
                 marker.touch();
                 extract(&tmp2, &companion.name, &dest)?;
@@ -742,7 +748,7 @@ fn try_ensure_from_network(
 }
 
 #[cfg(unix)]
-fn mark_executable(path: &Path) -> Result<()> {
+pub(crate) fn mark_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perm = std::fs::metadata(path)?.permissions();
     perm.set_mode(perm.mode() | 0o111);
@@ -750,7 +756,7 @@ fn mark_executable(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn mark_executable(_path: &Path) -> Result<()> {
+pub(crate) fn mark_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 

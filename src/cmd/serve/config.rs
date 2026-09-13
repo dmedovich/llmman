@@ -5,6 +5,8 @@
 //! scaling, the OOM shrink retry). Each `*_from_env` reads the process
 //! environment; its `parse_*` half is what the tests exercise.
 
+use std::path::PathBuf;
+
 /// Context tokens requested for every backend this daemon spawns — read
 /// from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve` flag).
 /// Forwarded to llama-server as-is for generation models (0 meaning
@@ -121,26 +123,29 @@ fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
     (n != 0).then_some(n)
 }
 
-/// `--threads <n>` for local `llama-server` spawns, `Some` only when a
-/// CPU limit binds. llama-server's own autodetection
-/// (`cpu_get_num_math()`) already picks the physical/math cores, so an
-/// unconstrained host passes nothing and leaves that choice alone. The
-/// derived value only corrects the case autodetection cannot see: a
-/// cgroup CPU quota, or a narrowed affinity mask, both carried by
-/// `std::thread::available_parallelism` (std walks /proc/self/cgroup
-/// and the ancestor chain itself, v1 and v2). A limit binds when
-/// `available_parallelism` is below the online CPU count; then that
-/// smaller value is passed. Accepted tradeoff: a quota between the
-/// physical-core and SMT-thread counts (e.g. --cpus=12 on an
-/// 8-core/16-thread host) passes 12 where autodetection would pick 8.
-/// Any read or parse failure returns `None`: fail closed to
-/// autodetection. `LLAMA_ARG_THREADS` set in the environment wins:
-/// llama-server reads it itself via plain env inheritance, so `None`
-/// here keeps that explicit choice untouched.
+/// `--threads <n>` for every `llama-server` this daemon spawns, `Some`
+/// only when a CPU limit binds ([`host_cpu_limit`]). Unconstrained,
+/// llama-server's own autodetection (`cpu_get_num_math()`) already
+/// picks the math cores; the derived value only corrects what it
+/// cannot see: a cgroup quota or a narrowed affinity mask. Accepted
+/// tradeoff: a quota between the physical-core and SMT-thread counts
+/// (`--cpus=12` on 8c/16t) passes 12 where autodetection would pick 8.
+/// `LLAMA_ARG_THREADS` set wins: `None` here, llama-server reads it
+/// itself (in a container, via `LLAMA_CPP_ENV_PASSTHROUGH_VARS`).
 pub(super) fn threads_from_env_or_host() -> Option<u32> {
     if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
         return None;
     }
+    host_cpu_limit()
+}
+
+/// This daemon's effective CPU limit in whole CPUs, `Some(n)` only when
+/// one binds: `std::thread::available_parallelism` — min(affinity,
+/// cgroup quota), floored, at least 1; std walks the cgroup ancestor
+/// chain itself, v1 and v2 — below the online CPU count from
+/// /sys/devices/system/cpu/online. Any read failure is `None`: fail
+/// closed. Linux only.
+pub(super) fn host_cpu_limit() -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         let allowed = std::thread::available_parallelism().ok()?.get() as u32;
@@ -149,6 +154,62 @@ pub(super) fn threads_from_env_or_host() -> Option<u32> {
     }
     #[cfg(not(target_os = "linux"))]
     None
+}
+
+/// The backend container's `--cpus`: this daemon's cgroup v2 quota as a
+/// fraction (the tightest `cpu.max` on its own chain, so `0.5` stays
+/// `0.5`), capped by its affinity mask; without a v2 quota, the
+/// whole-CPU [`host_cpu_limit`] (a cgroup v1 quota is floored). `Some`
+/// only when it binds. Needed even when `LLAMA_ARG_THREADS` owns the
+/// thread count.
+pub(super) fn container_cpu_limit() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let online = online_cpu_count()?;
+        let limit = match cgroup_v2_cpu_quota() {
+            Some(q) => q.min(f64::from(affinity_cpu_count().unwrap_or(online))),
+            None => f64::from(host_cpu_limit()?),
+        };
+        (limit < f64::from(online)).then_some(limit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// CPUs in this process's affinity mask, from `Cpus_allowed_list` in
+/// /proc/self/status.
+#[cfg(target_os = "linux")]
+fn affinity_cpu_count() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let list = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?;
+    cpu_list_count(list)
+}
+
+/// The tightest `cpu.max` quota, in CPUs, from this process's cgroup v2
+/// node up to the root; `None` without one.
+#[cfg(target_os = "linux")]
+fn cgroup_v2_cpu_quota() -> Option<f64> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    root.join(rel.trim_start_matches('/'))
+        .ancestors()
+        .take_while(|d| d.starts_with(root))
+        .filter_map(|d| std::fs::read_to_string(d.join("cpu.max")).ok())
+        .filter_map(|s| parse_cpu_max(&s))
+        .reduce(f64::min)
+}
+
+/// `cpu.max`'s `<quota> <period>` in microseconds as CPUs; `max <period>`
+/// (unlimited) or malformed content is `None`.
+#[cfg(target_os = "linux")]
+fn parse_cpu_max(content: &str) -> Option<f64> {
+    let mut parts = content.split_whitespace();
+    let quota: f64 = parts.next()?.parse().ok()?;
+    let period: f64 = parts.next()?.parse().ok()?;
+    (quota > 0.0 && period > 0.0).then(|| quota / period)
 }
 
 /// Online CPUs from /sys/devices/system/cpu/online, the baseline
@@ -231,11 +292,36 @@ fn parse_max_queue(value: Option<&str>) -> usize {
     }
 }
 
+/// The certificate chain and private key `llmman serve` terminates TLS
+/// with, from `LLMMAN_TLS_CERT` and `LLMMAN_TLS_KEY` (PEM paths). Both or
+/// neither: one alone is a misconfiguration, refused at startup rather
+/// than served over plain http.
+pub(super) fn tls_from_env() -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    parse_tls(
+        std::env::var_os("LLMMAN_TLS_CERT"),
+        std::env::var_os("LLMMAN_TLS_KEY"),
+    )
+}
+
+fn parse_tls(
+    cert: Option<std::ffi::OsString>,
+    key: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    let present = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
+    match (present(cert), present(key)) {
+        (Some(cert), Some(key)) => Ok(Some((cert, key))),
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!("LLMMAN_TLS_CERT is set but LLMMAN_TLS_KEY is not"),
+        (None, Some(_)) => anyhow::bail!("LLMMAN_TLS_KEY is set but LLMMAN_TLS_CERT is not"),
+    }
+}
+
 /// Whether to serve `GET /metrics` at all, from `LLMMAN_METRICS`. Off
-/// unless the operator asked for it: the router has no authentication,
-/// `LLMMAN_HOST` can bind it beyond loopback, and a scrape reports
-/// version, route mix, model names and model churn. None of that should
-/// start answering because llmman was upgraded.
+/// unless the operator asked for it: a daemon without keys (see the
+/// `auth` module) has no authentication, and a scrape reports version,
+/// route mix, model names and model churn. None of that should start
+/// answering because llmman was upgraded. With keys configured, the
+/// scrape route requires one like every other.
 pub(super) fn metrics_enabled_from_env() -> bool {
     parse_metrics_enabled(std::env::var("LLMMAN_METRICS").ok().as_deref())
 }
@@ -399,6 +485,25 @@ mod tests {
     }
 
     #[test]
+    fn tls_takes_both_paths_or_neither() {
+        let os = |v: &str| Some(std::ffi::OsString::from(v));
+        assert_eq!(parse_tls(None, None).unwrap(), None);
+        assert_eq!(parse_tls(os(""), os("")).unwrap(), None, "blank is unset");
+        assert_eq!(
+            parse_tls(os("/c.pem"), os("/k.pem")).unwrap(),
+            Some((PathBuf::from("/c.pem"), PathBuf::from("/k.pem")))
+        );
+        assert!(parse_tls(os("/c.pem"), None)
+            .unwrap_err()
+            .to_string()
+            .contains("LLMMAN_TLS_KEY"));
+        assert!(parse_tls(None, os("/k.pem"))
+            .unwrap_err()
+            .to_string()
+            .contains("LLMMAN_TLS_CERT"));
+    }
+
+    #[test]
     fn parse_context_length_accepts_a_plain_number_and_rejects_everything_else() {
         assert_eq!(parse_context_length(Some("32768")), Some(32768));
         assert_eq!(parse_context_length(Some(" 32768 \n")), Some(32768));
@@ -501,6 +606,17 @@ mod tests {
         ];
         for (list, expected) in &cases {
             assert_eq!(&cpu_list_count(list), expected, "list={list:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cpu_max_reads_quota_over_period_and_treats_max_as_unlimited() {
+        assert_eq!(parse_cpu_max("200000 100000\n"), Some(2.0));
+        assert_eq!(parse_cpu_max("50000 100000\n"), Some(0.5));
+        assert_eq!(parse_cpu_max("150000 100000"), Some(1.5));
+        for bad in ["max 100000\n", "", "100000", "0 100000", "100000 0", "x y"] {
+            assert_eq!(parse_cpu_max(bad), None, "{bad:?}");
         }
     }
 

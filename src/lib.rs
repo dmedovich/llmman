@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+pub mod auth;
+pub mod chat_template;
 pub mod cmd;
 pub mod config;
 pub mod container;
@@ -16,6 +18,7 @@ pub mod imagegen;
 pub mod llama_release;
 pub mod mediagen;
 pub mod metrics;
+pub mod mlx_release;
 pub mod modelpack;
 pub mod oauth;
 pub mod promptlog;
@@ -37,6 +40,16 @@ pub fn default_store() -> anyhow::Result<PathBuf> {
     if let Some(dir) = models_dir_from_env() {
         return Ok(dir);
     }
+    Ok(data_root()?.join("store"))
+}
+
+/// `~/.local/share/llmman` (`%LOCALAPPDATA%\llmman` on Windows): the
+/// parent of the default store and of everything else llmman keeps on
+/// disk for itself — the `llama-server` release cache
+/// (`llama_release`), the `uv` binary and `mlx-lm` environment
+/// (`mlx_release`). Not affected by `LLMMAN_MODELS`, which relocates
+/// only the store.
+pub fn data_root() -> anyhow::Result<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let base = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
@@ -45,7 +58,7 @@ pub fn default_store() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = dirs::data_local_dir()
         .ok_or_else(|| anyhow::anyhow!("could not determine local data directory"))?;
-    Ok(base.join("llmman").join("store"))
+    Ok(base.join("llmman"))
 }
 
 fn models_dir_from_env() -> Option<PathBuf> {
@@ -119,6 +132,20 @@ fn parse_env_flag(value: Option<&str>) -> bool {
         v.to_ascii_lowercase().as_str(),
         "0" | "false" | "no" | "off"
     )
+}
+
+/// The first `name` (`name.exe` on Windows) that is a file in a `PATH`
+/// directory.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(&file))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]

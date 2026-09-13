@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use llmman::{cmd, daemon, ffi, hostgpu};
 
 // ---------------------------------------------------------------------------
@@ -14,7 +14,7 @@ use llmman::{cmd, daemon, ffi, hostgpu};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -22,7 +22,7 @@ enum Commands {
     /// Launch an integration
     Launch(cmd::launch::LaunchArgs),
     /// Run a model interactively or with a one-shot prompt
-    Run(cmd::run::RunArgs),
+    Run(Box<cmd::run::RunArgs>),
     /// Package model files into a local OCI image
     Build(cmd::build::BuildArgs),
     /// Log in to a container registry or HuggingFace
@@ -33,6 +33,8 @@ enum Commands {
     Push(cmd::push::PushArgs),
     /// Pull an image from a registry to the local store
     Pull(cmd::pull::PullArgs),
+    /// Search for models on Docker Hub and Hugging Face
+    Search(cmd::search::SearchArgs),
     /// Pull (if needed) and print a model's local path as JSON (internal,
     /// used by the vllm-llmman plugin)
     #[command(hide = true)]
@@ -104,7 +106,15 @@ fn main() {
     daemon::disable_std_handle_inheritance();
 
     let cli = Cli::parse_from(cmd::log::expand_count_shorthand(std::env::args_os()));
-    let result = match &cli.command {
+    // A bare `llmman` is a request for help, not a usage error: print it
+    // and exit 0 rather than clap's 2 (which winget's validator flags).
+    let Some(command) = &cli.command else {
+        Cli::command()
+            .print_help()
+            .expect("failed to write help to stdout");
+        return;
+    };
+    let result = match command {
         Commands::Launch(a) => cmd::launch::run(a),
         Commands::Run(a) => cmd::run::run(a),
         Commands::Build(a) => cmd::build::run(a),
@@ -112,6 +122,7 @@ fn main() {
         Commands::Logout(a) => cmd::logout::run(a),
         Commands::Push(a) => cmd::push::run(a),
         Commands::Pull(a) => cmd::pull::run(a),
+        Commands::Search(a) => cmd::search::run(a),
         Commands::Resolve(a) => cmd::resolve::run(a),
         Commands::Transfer(a) => cmd::transfer::run(a),
         Commands::Verify(a) => cmd::verify::run(a),

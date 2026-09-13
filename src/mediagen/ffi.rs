@@ -5,7 +5,7 @@
 #![allow(non_camel_case_types, dead_code)]
 
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use libloading::Library;
@@ -189,16 +189,19 @@ pub type LogCallback =
     unsafe extern "C" fn(level: c_int, text: *const c_char, user_data: *mut c_void);
 
 macro_rules! api {
-    ($(fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?;)*) => {
-        /// The bound function pointers.
+    ($(fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?;)*
+     optional: $(fn $oname:ident($($oarg:ident: $oty:ty),*) $(-> $oret:ty)?;)*) => {
+        /// The bound function pointers; `optional` ones may be absent from older releases.
         pub struct Api {
             _libs: Vec<Library>,
             $(pub $name: unsafe extern "C" fn($($arg: $ty),*) $(-> $ret)?,)*
+            $(pub $oname: Option<unsafe extern "C" fn($($oarg: $oty),*) $(-> $oret)?>,)*
         }
         impl Api {
             fn bind(libs: Vec<Library>) -> Result<Self> {
                 $(let $name = lookup(&libs, stringify!($name))?;)*
-                Ok(Self { _libs: libs, $($name,)* })
+                $(let $oname = lookup(&libs, stringify!($oname)).ok();)*
+                Ok(Self { _libs: libs, $($name,)* $($oname,)* })
             }
         }
     };
@@ -242,6 +245,7 @@ api! {
     fn ggml_sqrt(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_log(ctx: *mut GgmlContext, a: Tensor) -> Tensor;
     fn ggml_clamp(ctx: *mut GgmlContext, a: Tensor, min: f32, max: f32) -> Tensor;
+    fn ggml_cpy(ctx: *mut GgmlContext, a: Tensor, b: Tensor) -> Tensor;
     fn ggml_reshape_2d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64) -> Tensor;
     fn ggml_reshape_3d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64) -> Tensor;
     fn ggml_reshape_4d(ctx: *mut GgmlContext, a: Tensor, ne0: i64, ne1: i64, ne2: i64, ne3: i64) -> Tensor;
@@ -323,6 +327,11 @@ api! {
     fn llama_sampler_init_dist(seed: u32) -> *mut LlamaSampler;
     fn llama_sampler_sample(smpl: *mut LlamaSampler, ctx: *mut LlamaContextT, idx: i32) -> LlamaToken;
     fn llama_sampler_free(smpl: *mut LlamaSampler);
+
+    optional:
+    // direct 2-D convolution (no im2col), ggml >= mid-2025
+    fn ggml_conv_2d_direct(ctx: *mut GgmlContext, a: Tensor, b: Tensor, s0: c_int, s1: c_int, p0: c_int, p1: c_int, d0: c_int, d1: c_int) -> Tensor;
+    fn ggml_backend_supports_op(backend: GgmlBackend, op: Tensor) -> bool;
 }
 
 fn lookup<T: Copy>(libs: &[Library], name: &str) -> Result<T> {
@@ -369,6 +378,41 @@ pub fn has_libs(dir: &Path) -> bool {
         .all(|stem| dir.join(lib_name(stem)).exists())
 }
 
+/// The ggml/llama libraries of the `llama-server` at `bin`: next to it in
+/// a release archive or image, in `../lib` for an installed build.
+pub fn lib_dir_of(bin: &Path) -> Option<PathBuf> {
+    let dir = bin.parent()?;
+    [dir.to_path_buf(), dir.join("../lib"), dir.join("../lib64")]
+        .into_iter()
+        .find(|d| has_libs(d))
+}
+
+/// The mirrored [`LlamaModelParams`] prefix holds for this libllama if the
+/// defaults it fills in land at the mirrored offsets.
+pub fn check_model_params(p: &LlamaModelParams) -> Result<()> {
+    if p.split_mode != 1 || p.main_gpu != 0 || p.vocab_only || p.check_tensors || !p.use_extra_bufts
+    {
+        anyhow::bail!("llama_model_params layout does not match this libllama");
+    }
+    Ok(())
+}
+
+/// [`check_model_params`] for [`LlamaContextParams`].
+pub fn check_context_params(p: &LlamaContextParams) -> Result<()> {
+    if p.n_batch != 2048
+        || p.n_ubatch != 512
+        || p.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_AUTO
+        || p.type_k != ty::F16
+        || !p.offload_kqv
+        || !p.op_offload
+        || !p.swa_full
+        || p.kv_unified
+    {
+        anyhow::bail!("llama_context_params layout does not match this libllama");
+    }
+    Ok(())
+}
+
 impl Api {
     /// Loads `libggml-base`, `libggml` and `libllama` from `dir`, then the
     /// backend modules found there (`libggml-cuda`, `libggml-metal`, …).
@@ -385,6 +429,19 @@ impl Api {
             (api.llama_backend_init)();
         }
         Ok(api)
+    }
+
+    /// Everything the pipeline assumes about this llama.cpp that binding
+    /// the symbols did not already prove: the two mirrored param structs.
+    /// No model needed, so CI can run it against the pinned release.
+    pub fn check_layout(&self) -> Result<()> {
+        unsafe {
+            let mut mp = (self.llama_model_default_params)();
+            check_model_params(mp.view_mut::<LlamaModelParams>())?;
+            let mut cp = (self.llama_context_default_params)();
+            check_context_params(cp.view_mut::<LlamaContextParams>())?;
+        }
+        Ok(())
     }
 
     pub fn set_n_threads(&self, backend: GgmlBackend, n: i32) {
